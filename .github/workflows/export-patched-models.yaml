@@ -27,7 +27,8 @@ permissions:
 
 env:
   PATCH_DIR: model-patches
-  CONFIG: config/models.yaml
+  # Both are inside the patch-repo checkout (see `path: patch-repo` below).
+  CONFIG: patch-repo/config/models.yaml
   ML_MODELS_REPO: https://github.com/immich-app/ml-models.git
   ML_MODELS_PIN: a8a96c56ed86af512fc14dffe013cae52c0247c6
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-patched-models
