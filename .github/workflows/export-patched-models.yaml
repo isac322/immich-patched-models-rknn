@@ -38,10 +38,6 @@ env:
   # compiled models with librknnrt 2.3.2 runtime crashes inference with
   # SIGSEGV on the rk3588 NPU.
   RKNN_TOOLKIT_VERSION: "2.3.2"
-  # busybox 1.37 arm64 digest. NEVER use a multi-arch tag: `crane append` resolves
-  # multi-arch indexes to amd64 by default and the resulting image fails to exec
-  # on the arm64 init container.
-  BASE_IMAGE: busybox:1.37@sha256:f10e809bcf667d8e9f01d2baf82869049a495cd448cdfe1f4dee94078b960ae9
   TARGET_PLATFORM: rk3588
 
 jobs:
@@ -293,15 +289,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Append payload onto busybox base and push
+      - name: Append payload onto empty base and push
         env:
           TAG: ${{ needs.resolve-version.outputs.tag }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -e
           dest="$IMAGE_NAME:$TAG"
+          # The image is consumed exclusively as a kubelet ImageVolume
+          # (k8s 1.33+). Nothing ever execs inside it, so the busybox layer
+          # we used to ship is dead weight - produce a scratch image with
+          # only the payload layer.
           crane append \
-            --base "$BASE_IMAGE" \
+            --oci-empty-base \
             --new_layer /tmp/payload.tar.gz \
             --new_tag "$dest"
           # Annotate the resulting image so the provenance is greppable.
