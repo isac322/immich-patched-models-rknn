@@ -1,0 +1,15 @@
+# Models to export with the patched ml-models exporter.
+# Format per line: `- <model_name> <model_source>`
+# - model_name : HuggingFace name under immich-app/* (used by `immich_model_exporter`)
+# - model_source: one of openclip | mclip | insightface (matches ModelSource enum)
+#
+# The exporter writes ONNX + RKNN artifacts under <output_dir>/<model_name>/.
+# After the run we keep ONLY the .rknn files in the OCI image - Immich downloads
+# everything else (ONNX, tokenizer, etc.) from HF at runtime.
+#
+# Adding a model here will:
+#   1. Trigger a rebuild on the next push of this file (paths: filter).
+#   2. Be included in the next scheduled / manual build.
+#   3. Make the resulting image larger (~1.5 GiB per RKNN model).
+models:
+  - nllb-clip-large-siglip__mrl openclip

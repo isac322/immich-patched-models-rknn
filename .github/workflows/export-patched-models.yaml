@@ -1,0 +1,336 @@
+name: export-patched-models
+
+on:
+  workflow_dispatch:
+    inputs:
+      immich_version:
+        description: Immich tag to export models for (e.g. v2.7.5). Empty = latest release.
+        required: false
+        type: string
+      force_rebuild:
+        description: Rebuild even if our package already has the matching tag.
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 5 * * *'   # daily UTC 05:00, one hour after the ML image build
+  push:
+    branches: [main]
+    paths:
+      - 'model-patches/**'
+      - 'config/models.yaml'
+      - '.github/workflows/export-patched-models.yaml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PATCH_DIR: model-patches
+  CONFIG: config/models.yaml
+  ML_MODELS_REPO: https://github.com/immich-app/ml-models.git
+  ML_MODELS_PIN: a8a96c56ed86af512fc14dffe013cae52c0247c6
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-patched-models
+  PACKAGE_NAME: immich-patched-models
+  # busybox 1.37 arm64 digest. NEVER use a multi-arch tag: `crane append` resolves
+  # multi-arch indexes to amd64 by default and the resulting image fails to exec
+  # on the arm64 init container.
+  BASE_IMAGE: busybox:1.37@sha256:f10e809bcf667d8e9f01d2baf82869049a495cd448cdfe1f4dee94078b960ae9
+  TARGET_PLATFORM: rk3588
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+    steps:
+      - name: Determine target Immich version + tag
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.immich_version }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -e
+          if [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version=$(gh api /repos/immich-app/immich/releases/latest --jq '.tag_name')
+          fi
+          tag="${version}-rknn"
+          echo "Target version: $version"
+          echo "Target tag    : $tag"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "force_rebuild=true; building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          owner="${{ github.repository_owner }}"
+          exists=""
+          if response=$(gh api "/users/$owner/packages/container/${{ env.PACKAGE_NAME }}/versions" --paginate 2>/dev/null); then
+            exists=$(echo "$response" | jq -r --arg tag "$tag" '.[] | select((.metadata.container.tags // []) | index($tag)) | .name' | head -1)
+          fi
+          if [ -n "$exists" ]; then
+            echo "Tag $tag already in package (digest=$exists). Skipping export."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $tag not in package; will export."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  export-and-push:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch-repo
+
+      - name: Free up disk space
+        run: |
+          set -e
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift || true
+          docker image prune -af || true
+          df -h /
+
+      - name: Add swap (export peaks > 16 GiB)
+        run: |
+          set -e
+          # nllb-clip-large textual export peaks ~15-20 GiB. Runner has 16 GiB RAM
+          # so add swap as safety margin. Use /mnt which has the larger SSD.
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Clone ml-models at pinned commit
+        run: |
+          set -e
+          git clone "$ML_MODELS_REPO" ml-models
+          cd ml-models
+          git checkout "$ML_MODELS_PIN"
+          git log -1 --oneline
+
+      - name: Apply model patches in order
+        working-directory: ml-models
+        run: |
+          set -e
+          shopt -s nullglob
+          patches=( ../patch-repo/${{ env.PATCH_DIR }}/*.patch )
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::No patches found in ${{ env.PATCH_DIR }}/"
+            exit 1
+          fi
+          for patch in "${patches[@]}"; do
+            echo "::group::Applying $(basename "$patch")"
+            head -5 "$patch"
+            if ! git apply --check "$patch"; then
+              echo "::error::Patch $(basename "$patch") does NOT apply to pin $ML_MODELS_PIN. Refresh the patch series and retry."
+              exit 1
+            fi
+            git apply "$patch"
+            echo "::endgroup::"
+          done
+          echo "All patches applied. Modified state:"
+          git status --short
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.15"
+          # MUST pin: ml-models .python-version says 3.14 but rknn-toolkit2
+          # only ships cp310/cp311/cp312 manylinux wheels for arm64.
+          python-version: "3.12"
+
+      - name: Refresh uv.lock against patched pyproject.toml
+        working-directory: ml-models
+        run: |
+          set -e
+          if git diff --quiet -- pyproject.toml uv.lock; then
+            echo "No pyproject/uv.lock changes from patches; skipping lock refresh."
+          else
+            echo "Regenerating uv.lock to reflect patched pyproject.toml..."
+            uv lock --no-progress
+          fi
+
+      - name: Install dependencies
+        working-directory: ml-models
+        run: |
+          set -e
+          # PR #32 moves rknn-toolkit2 to the `rknn` optional-dependency group
+          # and gates it on python_version < '3.13'. Our 3.12 pin satisfies that.
+          uv sync --no-dev --extra rknn --no-progress
+          uv pip list | grep -E '^(rknn|onnx|torch|open_clip|multilingual|transformers)' || true
+
+      - name: Read model list from config
+        id: models
+        run: |
+          set -e
+          # Format per line: `- <model_name> <model_source>`
+          # Source must be one of: openclip | mclip | insightface
+          models=$(grep -E '^[[:space:]]*-[[:space:]]+' "$CONFIG" \
+            | sed -E 's/^[[:space:]]*-[[:space:]]+//' \
+            | awk 'NF==2 {print $1"\t"$2}')
+          if [ -z "$models" ]; then
+            echo "::error::No models found in $CONFIG"
+            exit 1
+          fi
+          echo "Models to export:"
+          echo "$models" | column -t
+          # Persist for next step (newline-delimited via env file)
+          {
+            echo "models<<EOF"
+            echo "$models"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Export each model
+        working-directory: ml-models
+        env:
+          MODELS: ${{ steps.models.outputs.models }}
+        run: |
+          set -e
+          export_root=/tmp/export-out
+          mkdir -p "$export_root"
+          while IFS=$'\t' read -r name source; do
+            [ -z "$name" ] && continue
+            echo "::group::Exporting $name ($source) for $TARGET_PLATFORM"
+            uv run --no-dev python -m immich_model_exporter export \
+              "$name" "$source" \
+              --output-dir "$export_root" \
+              --target-platform "$TARGET_PLATFORM" \
+              --no-cache
+            echo "Export complete. Resulting files:"
+            find "$export_root/$name" -type f | sort
+            echo "::endgroup::"
+          done <<< "$MODELS"
+          echo "Disk after export:"
+          df -h /
+
+      - name: Stage cache-shaped payload (keep only .rknn)
+        env:
+          MODELS: ${{ steps.models.outputs.models }}
+        run: |
+          set -e
+          export_root=/tmp/export-out
+          stage=/tmp/staging
+          mkdir -p "$stage"
+          while IFS=$'\t' read -r name source; do
+            [ -z "$name" ] && continue
+            case "$source" in
+              openclip|mclip) prefix=clip ;;
+              insightface)    prefix=facial-recognition ;;
+              *)
+                echo "::error::Unknown model source '$source' for $name"
+                exit 1
+                ;;
+            esac
+            src="$export_root/$name"
+            dst="$stage/$prefix/$name"
+            if [ ! -d "$src" ]; then
+              echo "::error::Expected export output at $src but directory is missing"
+              exit 1
+            fi
+            # Strip every non-.rknn artifact: Immich already fetches ONNX +
+            # tokenizer from HF at runtime. We only ship the NPU-compiled blob.
+            find "$src" -type f ! -name '*.rknn' -delete
+            find "$src" -type d -empty -delete
+            mkdir -p "$(dirname "$dst")"
+            mv "$src" "$dst"
+            # Verify at least one .rknn made it through.
+            if ! find "$dst" -type f -name '*.rknn' | grep -q .; then
+              echo "::error::No .rknn files survived staging for $name; check exporter output."
+              exit 1
+            fi
+          done <<< "$MODELS"
+          echo "Staged tree:"
+          find "$stage" -type f | sort
+          echo "Per-file sha256:"
+          find "$stage" -type f -name '*.rknn' -exec sha256sum {} +
+          tar -C "$stage" -czf /tmp/payload.tar.gz .
+          ls -lh /tmp/payload.tar.gz
+
+      - name: Install crane
+        run: |
+          set -e
+          tmp=$(mktemp -d)
+          curl -fsSL \
+            "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_arm64.tar.gz" \
+            | tar -xz -C "$tmp" crane
+          sudo install -m 0755 "$tmp/crane" /usr/local/bin/crane
+          crane version
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Append payload onto busybox base and push
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -e
+          dest="$IMAGE_NAME:$TAG"
+          crane append \
+            --base "$BASE_IMAGE" \
+            --new_layer /tmp/payload.tar.gz \
+            --new_tag "$dest"
+          # Annotate the resulting image so the provenance is greppable.
+          # crane mutate adds/overwrites labels on the just-pushed image.
+          crane mutate "$dest" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.description=Pre-compiled RKNN artifacts for Immich (PR #32 CumSum->MatMul patched, target=$TARGET_PLATFORM)" \
+            --label "org.opencontainers.image.licenses=AGPL-3.0" \
+            --label "io.bhyoo.immich.upstream-version=$VERSION" \
+            --label "io.bhyoo.immich.target-platform=$TARGET_PLATFORM" \
+            --label "io.bhyoo.immich.ml-models-pin=$ML_MODELS_PIN" \
+            --label "io.bhyoo.immich.patch=ml-models-pr-32-cumsum-matmul"
+          digest=$(crane digest "$dest")
+          echo "Pushed: $dest@$digest"
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Summary
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          MODELS: ${{ steps.models.outputs.models }}
+        run: |
+          {
+            echo "## Patched RKNN models"
+            echo
+            echo "\`$IMAGE_NAME:$TAG@$DIGEST\`"
+            echo
+            echo "### Target platform"
+            echo "\`$TARGET_PLATFORM\`"
+            echo
+            echo "### Models"
+            echo '```'
+            echo "$MODELS" | column -t
+            echo '```'
+            echo
+            echo "### Image contents"
+            echo '```'
+            tar -tzf /tmp/payload.tar.gz | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
