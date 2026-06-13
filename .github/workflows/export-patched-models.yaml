@@ -166,17 +166,18 @@ jobs:
         working-directory: ml-models
         run: |
           set -e
-          # MUST use --frozen. The patch series already updates uv.lock to a
-          # snapshot consistent with the patched pyproject. Regenerating the lock
-          # picks up newer minor versions (notably transformers 5.x) that have
-          # broken NLLB tokenizer mappings:
-          #   AttributeError: 'NoneType' object has no attribute 'replace'
-          # at transformers/models/auto/tokenization_auto.py during
-          # AutoTokenizer.from_pretrained for nllb-clip textual export.
-          # PR #32 moves rknn-toolkit2 to the `rknn` optional-dependency group
-          # gated on python_version < '3.13'; our 3.12 pin satisfies that.
+          # MUST use --frozen. PR #32 updates uv.lock in lock-step with its
+          # pyproject change so the frozen lock is consistent. PR #32 moves
+          # rknn-toolkit2 to the `rknn` optional-dependency group gated on
+          # python_version < '3.13'; our 3.12 pin satisfies that.
           uv sync --no-dev --extra rknn --frozen --no-progress
-          uv pip list | grep -E '^(rknn|onnx|torch|open_clip|multilingual|transformers)' || true
+          # sentencepiece is not in ml-models' lock but transformers >=5
+          # returns TOKENIZER_MAPPING_NAMES["m2m_100"] = None when it's missing,
+          # which crashes AutoTokenizer.from_pretrained for the nllb-clip
+          # textual encoder with:
+          #   AttributeError: 'NoneType' object has no attribute 'replace'
+          uv pip install --no-progress sentencepiece
+          uv pip list | grep -E '^(rknn|onnx|torch|open_clip|multilingual|transformers|sentencepiece|tokenizers)' || true
 
       - name: Read model list from config
         id: models
