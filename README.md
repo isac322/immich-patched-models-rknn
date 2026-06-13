@@ -19,7 +19,7 @@ machine-learning cache PVC. It pairs with the matching ML server image at
 | Item | Value |
 | --- | --- |
 | Image | `ghcr.io/isac322/immich-patched-models:<immich-tag>-rknn` |
-| Base | `busybox:1.37` (arm64 digest-pinned) |
+| Base | scratch (no base layer; image is consumed as a kubelet ImageVolume, never executed) |
 | Target SoC | `rk3588` |
 | Build runner | `ubuntu-24.04-arm` (GH-hosted) |
 | Tooling | `rknn-toolkit2>=2.3.0`, Python 3.12 |
@@ -87,14 +87,16 @@ clear error if the patch series drifted.
      `model-patches/` in order;
    - installs `uv` pinned to Python 3.12 (ml-models' `.python-version` is 3.14,
      but `rknn-toolkit2` only publishes cp310/cp311/cp312 wheels);
-   - regenerates `uv.lock` against the patched `pyproject.toml`, runs
-     `uv sync --no-dev --extra rknn`;
+   - installs deps with `uv sync --frozen --no-dev --extra rknn` and pins
+     `rknn-toolkit2==2.3.2` to match the runtime `librknnrt.so` shipped in
+     the ML server image;
    - for each model in `config/models.yaml`, runs
      `python -m immich_model_exporter export <name> <source> --target-platform rk3588`;
    - strips everything but `*.rknn`, re-roots the tree under `clip/` /
      `facial-recognition/`, tarballs it;
-   - `crane append`s the tarball onto an arm64-pinned `busybox:1.37` and
-     pushes to GHCR with provenance labels.
+   - `crane append --oci-empty-base` produces a scratch image with only the
+     payload layer (no base utilities — the image is consumed exclusively as
+     a kubelet ImageVolume, never executed).
 
 ## Triggering a build
 
@@ -106,10 +108,43 @@ clear error if the patch series drifted.
 
 ## Consuming the image
 
-Use it as an `initContainer` on the Immich machine-learning pod. The image's
-single layer is rooted at `/`, so an `initContainer` that mounts the ML cache
-PVC at `/cache` can simply `cp -rn /clip /facial-recognition /cache/` (with a
-per-file `sha256sum` check if you want idempotent refresh on tag bump).
+The image is meant to be mounted into the Immich ML pod via the Kubernetes
+[ImageVolume source][image-volume] (alpha in 1.31, beta in 1.33, GA in 1.34).
+The pod consumes individual model directories via `subPath` mounts overlaid
+on top of the writable ML cache PVC.
+
+[image-volume]: https://kubernetes.io/docs/concepts/storage/volumes/#image
+
+```yaml
+volumes:
+  - name: cache
+    persistentVolumeClaim: { claimName: immich-machine-learning-cache }
+  - name: patched-models
+    image:
+      reference: ghcr.io/isac322/immich-patched-models:v2.7.5-rknn
+      pullPolicy: IfNotPresent
+volumeMounts:
+  - { name: cache, mountPath: /cache }
+  - name: patched-models
+    mountPath: /cache/clip/nllb-clip-large-siglip__mrl/textual/rknpu
+    subPath:   clip/nllb-clip-large-siglip__mrl/textual/rknpu
+    readOnly: true
+  - name: patched-models
+    mountPath: /cache/clip/nllb-clip-large-siglip__mrl/visual/rknpu
+    subPath:   clip/nllb-clip-large-siglip__mrl/visual/rknpu
+    readOnly: true
+```
+
+Two ImageVolume gotchas worth knowing:
+
+1. `subPath` must reference a **directory**, not an individual file —
+   containerd's CRI implementation rejects file subpaths
+   (`ImageVolumeMountFailed: only directory subpath is supported`).
+   Mount the smallest enclosing directory (here: `rknpu/`).
+2. `pullPolicy: IfNotPresent` plus an unchanged tag means kubelet will
+   keep using a stale cached digest after a force-rebuild. For tag bumps
+   on new Immich releases this is fine; for in-place rebuilds either bump
+   the tag or `crictl rmi` on the node before the next pod restart.
 
 For a working example, see the [homelab Immich values][homelab-values] in
 `isac322/homelab`.
