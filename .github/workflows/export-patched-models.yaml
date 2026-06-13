@@ -162,24 +162,20 @@ jobs:
           # only ships cp310/cp311/cp312 manylinux wheels for arm64.
           python-version: "3.12"
 
-      - name: Refresh uv.lock against patched pyproject.toml
-        working-directory: ml-models
-        run: |
-          set -e
-          if git diff --quiet -- pyproject.toml uv.lock; then
-            echo "No pyproject/uv.lock changes from patches; skipping lock refresh."
-          else
-            echo "Regenerating uv.lock to reflect patched pyproject.toml..."
-            uv lock --no-progress
-          fi
-
       - name: Install dependencies
         working-directory: ml-models
         run: |
           set -e
+          # MUST use --frozen. The patch series already updates uv.lock to a
+          # snapshot consistent with the patched pyproject. Regenerating the lock
+          # picks up newer minor versions (notably transformers 5.x) that have
+          # broken NLLB tokenizer mappings:
+          #   AttributeError: 'NoneType' object has no attribute 'replace'
+          # at transformers/models/auto/tokenization_auto.py during
+          # AutoTokenizer.from_pretrained for nllb-clip textual export.
           # PR #32 moves rknn-toolkit2 to the `rknn` optional-dependency group
-          # and gates it on python_version < '3.13'. Our 3.12 pin satisfies that.
-          uv sync --no-dev --extra rknn --no-progress
+          # gated on python_version < '3.13'; our 3.12 pin satisfies that.
+          uv sync --no-dev --extra rknn --frozen --no-progress
           uv pip list | grep -E '^(rknn|onnx|torch|open_clip|multilingual|transformers)' || true
 
       - name: Read model list from config
