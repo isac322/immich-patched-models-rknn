@@ -33,6 +33,11 @@ env:
   ML_MODELS_PIN: a8a96c56ed86af512fc14dffe013cae52c0247c6
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-patched-models
   PACKAGE_NAME: immich-patched-models
+  # MUST match the librknnrt.so version shipped in the consuming ML image
+  # (immich-app/immich Dockerfile fetches v2.3.2). Mixing toolkit 2.3.0
+  # compiled models with librknnrt 2.3.2 runtime crashes inference with
+  # SIGSEGV on the rk3588 NPU.
+  RKNN_TOOLKIT_VERSION: "2.3.2"
   # busybox 1.37 arm64 digest. NEVER use a multi-arch tag: `crane append` resolves
   # multi-arch indexes to amd64 by default and the resulting image fails to exec
   # on the arm64 init container.
@@ -171,6 +176,10 @@ jobs:
           # rknn-toolkit2 to the `rknn` optional-dependency group gated on
           # python_version < '3.13'; our 3.12 pin satisfies that.
           uv sync --no-dev --extra rknn --frozen --no-progress
+          # Force the toolkit to RKNN_TOOLKIT_VERSION (see env block). The
+          # frozen lock pins 2.3.0; we override only this single package
+          # without touching the rest of the resolution.
+          uv pip install --no-progress --upgrade "rknn-toolkit2==${RKNN_TOOLKIT_VERSION}"
           # sentencepiece is not in ml-models' lock but transformers >=5
           # returns TOKENIZER_MAPPING_NAMES["m2m_100"] = None when it's missing,
           # which crashes AutoTokenizer.from_pretrained for the nllb-clip
@@ -299,7 +308,7 @@ jobs:
           # crane mutate adds/overwrites labels on the just-pushed image.
           crane mutate "$dest" \
             --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --label "org.opencontainers.image.description=Pre-compiled RKNN artifacts for Immich (PR #32 CumSum->MatMul patched, target=$TARGET_PLATFORM)" \
+            --label "org.opencontainers.image.description=Pre-compiled RKNN artifacts for Immich (PR #32 CumSum->MatMul patched target=$TARGET_PLATFORM)" \
             --label "org.opencontainers.image.licenses=AGPL-3.0" \
             --label "io.bhyoo.immich.upstream-version=$VERSION" \
             --label "io.bhyoo.immich.target-platform=$TARGET_PLATFORM" \
